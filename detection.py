@@ -1,96 +1,220 @@
 """
-detection.py — 猫检测主循环
-使用 YOLOv8 追踪视频流中的猫，输出检测记录
+detection.py — 猫检测主循环（运动辅助版）
+
+架构：
+  1. 背景减除（MOG2）找运动区域 → 触发 YOLO 推理
+  2. YOLO 只在运动区域推理（省算力，过滤误检）
+  3. 无运动时每 STATIC_INTERVAL 帧全图跑一次（抓住睡觉的猫）
+  4. YOLO 是最终裁判：只有它说是猫/狗才记录
 
 用法：
-  python detection.py                     # 使用摄像头（树莓派）
-  python detection.py --source cat.mp4    # 使用视频文件（测试用）
-  python detection.py --source cat.jpg    # 使用图片（快速验证）
+  python detection.py                     # 使用摄像头
+  python detection.py --source cat.mp4    # 使用视频文件
+  python detection.py --no-show --source cat.mp4
 """
 
 import argparse
 import time
-from pathlib import Path
-
+import cv2
+import numpy as np
 from ultralytics import YOLO
 
 from zones import map_to_zone
 from logger import init_db, log_detection, Detection
 
-# YOLO 中"cat"对应的类别 ID（COCO 数据集第 15 类）
 CAT_CLASS_ID = 15
-DOG_CLASS_ID = 16  # 黑白花纹猫有时被误识别为狗，一并追踪
+DOG_CLASS_ID = 16
 PET_CLASS_IDS = [CAT_CLASS_ID, DOG_CLASS_ID]
 
-# 模型选择：
-#   yolov8n.pt  — 最小最快，漏检多（不推荐）
-#   yolov8s.pt  — 小模型，平衡速度和精度（树莓派可用）
-#   yolov8m.pt  — 中等，精度明显提升（推荐）
-#   yolov8l.pt  — 大模型，精度最高，但慢
+# 模型：yolov8m 平衡精度和速度
 MODEL_PATH = "yolov8m.pt"
 
+# 无运动时每隔多少帧全图扫一次（抓住静止的猫）
+STATIC_INTERVAL = 30
 
-def run(source=0, show=True, conf_threshold=0.15, debug=False):
+# 运动检测参数
+MOG2_HISTORY = 500          # 背景模型学习帧数
+MOG2_THRESHOLD = 50         # 像素变化阈值
+MOTION_MIN_AREA = 1500      # 最小运动区域面积（过滤噪点）
+MOTION_PADDING = 40         # 运动区域外扩像素（避免裁切太紧）
+
+
+def get_motion_regions(fgmask, frame_w, frame_h):
     """
-    主检测循环
-    
-    参数：
-      source         — 视频源（0=摄像头，或文件路径）
-      show           — 是否显示实时画面
-      conf_threshold — 最低置信度（低于此值忽略）
+    从前景掩码提取运动区域，返回合并后的 bounding box 列表。
+    每个 box: (x1, y1, x2, y2)
     """
-    # 初始化
-    init_db()
-    model = YOLO(MODEL_PATH)
-    print(f"✅ 模型加载完成：{MODEL_PATH}")
-    print(f"📹 视频源：{source}")
-    print("🐱 开始检测猫...\n")
+    # 形态学去噪
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_OPEN, kernel)
+    fgmask = cv2.dilate(fgmask, kernel, iterations=2)
 
-    # debug 模式：不过滤类别，看猫被误识别成什么
-    # 正常模式：同时追踪 cat + dog（黑白花猫易被误识别为狗）
-    track_classes = None if debug else PET_CLASS_IDS
+    contours, _ = cv2.findContours(fgmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # 用 track 模式（保持 track_id 稳定）
-    for result in model.track(
-        source=source,
-        stream=True,
-        classes=track_classes,
-        conf=conf_threshold,
-        show=show,
-        verbose=False,
-    ):
-        ts = time.time()
-        boxes = result.boxes
+    regions = []
+    for cnt in contours:
+        if cv2.contourArea(cnt) < MOTION_MIN_AREA:
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        # 外扩 padding，不超出边界
+        x1 = max(0, x - MOTION_PADDING)
+        y1 = max(0, y - MOTION_PADDING)
+        x2 = min(frame_w, x + w + MOTION_PADDING)
+        y2 = min(frame_h, y + h + MOTION_PADDING)
+        regions.append((x1, y1, x2, y2))
 
-        if boxes is None or len(boxes) == 0:
+    return regions
+
+
+def merge_regions(regions):
+    """合并重叠的运动区域，减少重复推理。"""
+    if not regions:
+        return []
+    merged = list(regions)
+    changed = True
+    while changed:
+        changed = False
+        result = []
+        used = [False] * len(merged)
+        for i in range(len(merged)):
+            if used[i]:
+                continue
+            x1, y1, x2, y2 = merged[i]
+            for j in range(i + 1, len(merged)):
+                if used[j]:
+                    continue
+                ax1, ay1, ax2, ay2 = merged[j]
+                # 有重叠则合并
+                if x1 < ax2 and x2 > ax1 and y1 < ay2 and y2 > ay1:
+                    x1 = min(x1, ax1)
+                    y1 = min(y1, ay1)
+                    x2 = max(x2, ax2)
+                    y2 = max(y2, ay2)
+                    used[j] = True
+                    changed = True
+            result.append((x1, y1, x2, y2))
+            used[i] = True
+        merged = result
+    return merged
+
+
+def run_yolo_on_regions(model, frame, regions, conf_threshold):
+    """
+    在指定区域裁剪图像跑 YOLO，返回检测结果列表。
+    每个结果: (track_id, zone, conf, cx, cy, x1, y1, x2, y2)
+    注意：坐标已转换回原图坐标系。
+    """
+    detections = []
+    h, w = frame.shape[:2]
+
+    for (rx1, ry1, rx2, ry2) in regions:
+        crop = frame[ry1:ry2, rx1:rx2]
+        if crop.size == 0:
             continue
 
-        for box in boxes:
-            # 置信度
-            conf = float(box.conf[0])
-            if conf < conf_threshold:
+        results = model.predict(
+            crop,
+            classes=PET_CLASS_IDS,
+            conf=conf_threshold,
+            verbose=False,
+        )
+        for result in results:
+            if result.boxes is None or len(result.boxes) == 0:
                 continue
+            for box in result.boxes:
+                conf = float(box.conf[0])
+                # 坐标转回原图
+                bx1, by1, bx2, by2 = box.xyxy[0].tolist()
+                ox1 = int(bx1) + rx1
+                oy1 = int(by1) + ry1
+                ox2 = int(bx2) + rx1
+                oy2 = int(by2) + ry1
+                cx = (ox1 + ox2) / 2
+                cy = (oy1 + oy2) / 2
+                zone = map_to_zone(cx, cy)
+                track_id = -1  # 裁剪推理没有 track id
+                detections.append((track_id, zone, conf, cx, cy, ox1, oy1, ox2, oy2))
 
-            # 追踪 ID（可能为 None，用 -1 兜底）
+    return detections
+
+
+def run_yolo_full_frame(model, frame, conf_threshold):
+    """全图跑 YOLO track（用于静止场景兜底）。"""
+    detections = []
+    results = model.track(
+        frame,
+        classes=PET_CLASS_IDS,
+        conf=conf_threshold,
+        verbose=False,
+        persist=True,
+    )
+    for result in results:
+        if result.boxes is None or len(result.boxes) == 0:
+            continue
+        for box in result.boxes:
+            conf = float(box.conf[0])
             track_id = int(box.id[0]) if box.id is not None else -1
-
-            # 中心点坐标
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             cx = (x1 + x2) / 2
             cy = (y1 + y2) / 2
-
-            # debug 模式：打印所有检测到的类别
-            if debug:
-                cls_id = int(box.cls[0])
-                cls_name = model.names[cls_id]
-                if cls_id != CAT_CLASS_ID:
-                    print(f"  [DEBUG] 非猫检测: cls={cls_name}({cls_id}) conf={conf:.2f} 位置=({cx:.0f},{cy:.0f})")
-                    continue  # debug 模式下跳过非猫
-
-            # 区域映射
             zone = map_to_zone(cx, cy)
+            detections.append((track_id, zone, conf, cx, cy,
+                                int(x1), int(y1), int(x2), int(y2)))
+    return detections
 
-            # 写入数据库
+
+def run(source=0, show=True, conf_threshold=0.15, debug=False):
+    init_db()
+    model = YOLO(MODEL_PATH)
+    bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+        history=MOG2_HISTORY,
+        varThreshold=MOG2_THRESHOLD,
+        detectShadows=False,
+    )
+
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        print(f"❌ 无法打开视频源：{source}")
+        return
+
+    print(f"✅ 模型：{MODEL_PATH}")
+    print(f"📹 视频源：{source}")
+    print(f"⚙️  置信度阈值：{conf_threshold}")
+    print("🐱 开始检测（运动辅助模式）...\n")
+
+    frame_idx = 0
+    total_detections = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_idx += 1
+        h, w = frame.shape[:2]
+        ts = time.time()
+
+        # ── 1. 背景减除，提取运动掩码 ──
+        fgmask = bg_subtractor.apply(frame)
+        motion_regions = get_motion_regions(fgmask, w, h)
+        motion_regions = merge_regions(motion_regions)
+        has_motion = len(motion_regions) > 0
+
+        # ── 2. 决定推理策略 ──
+        detections = []
+        mode = ""
+
+        if has_motion:
+            # 有运动：只在运动区域推理
+            detections = run_yolo_on_regions(model, frame, motion_regions, conf_threshold)
+            mode = f"motion({len(motion_regions)} regions)"
+        elif frame_idx % STATIC_INTERVAL == 0:
+            # 无运动：定时全图扫（抓住静止的猫）
+            detections = run_yolo_full_frame(model, frame, conf_threshold)
+            mode = "static_scan"
+
+        # ── 3. 记录检测结果 ──
+        for (track_id, zone, conf, cx, cy, x1, y1, x2, y2) in detections:
             det = Detection(
                 timestamp=ts,
                 track_id=track_id,
@@ -100,31 +224,59 @@ def run(source=0, show=True, conf_threshold=0.15, debug=False):
                 cy=cy,
             )
             log_detection(det)
-
-            # 控制台输出
+            total_detections += 1
             print(
                 f"[{time.strftime('%H:%M:%S')}] "
                 f"🐱 ID={track_id:3d} | "
                 f"区域={zone:8s} | "
                 f"置信度={conf:.2f} | "
-                f"位置=({cx:.0f}, {cy:.0f})"
+                f"位置=({cx:.0f},{cy:.0f}) | "
+                f"模式={mode}"
             )
+
+        # ── 4. 可视化（可选）──
+        if show:
+            vis = frame.copy()
+
+            # 画运动区域（蓝色虚线框）
+            if debug and has_motion:
+                for (rx1, ry1, rx2, ry2) in motion_regions:
+                    cv2.rectangle(vis, (rx1, ry1), (rx2, ry2), (255, 100, 0), 1)
+
+            # 画猫的检测框（红色）
+            for (track_id, zone, conf, cx, cy, x1, y1, x2, y2) in detections:
+                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                label = f"Cat #{track_id} | {zone} | {conf:.2f}"
+                cv2.putText(vis, label, (x1, y1 - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                cv2.circle(vis, (int(cx), int(cy)), 4, (0, 255, 255), -1)
+
+            # 状态水印
+            status = f"Frame {frame_idx} | {'MOTION' if has_motion else 'static'} | cats: {total_detections}"
+            cv2.putText(vis, status, (10, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+            cv2.imshow("CatWatch", vis)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    cap.release()
+    if show:
+        cv2.destroyAllWindows()
+    print(f"\n✅ 结束。共检测到猫 {total_detections} 次（{frame_idx} 帧）")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="猫位置检测")
-    parser.add_argument("--source", default=0, help="视频源（0=摄像头，或视频/图片路径）")
-    parser.add_argument("--no-show", action="store_true", help="不显示实时画面（无头模式，适合树莓派）")
-    parser.add_argument("--conf", type=float, default=0.25, help="最低置信度（默认0.25，降低可减少漏检）")
-    parser.add_argument("--model", type=str, default=MODEL_PATH, help="YOLO模型路径（默认yolov8s.pt）")
-    parser.add_argument("--debug", action="store_true", help="调试模式：显示所有检测类别，找出猫被误识别成啥")
+    parser = argparse.ArgumentParser(description="猫位置检测（运动辅助版）")
+    parser.add_argument("--source", default=0,
+                        help="视频源（0=摄像头，或视频/图片路径）")
+    parser.add_argument("--no-show", action="store_true",
+                        help="不显示实时画面（无头模式，树莓派用）")
+    parser.add_argument("--conf", type=float, default=0.15,
+                        help="置信度阈值（默认0.15）")
+    parser.add_argument("--debug", action="store_true",
+                        help="显示运动区域蓝框（调试用）")
     args = parser.parse_args()
-
-    if args.model != MODEL_PATH:
-        import ultralytics
-        # Allow overriding model at runtime
-        import detection as _self
-        _self.MODEL_PATH = args.model
 
     run(
         source=args.source if args.source != "0" else 0,
