@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# Model weights (大文件，不上传)
+*.pt
+*.onnx
+*.engine
+
+# 视频 / 图片（测试用，不上传）
+*.mp4
+*.avi
+*.mov
+*.jpg
+*.jpeg
+*.png
+cat.mp4
+output.mp4
+
+# 数据库
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# 日志
+logs/
+*.log
+
+# 环境变量
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# 地图图片（本地摄像头校准用）
+map/
